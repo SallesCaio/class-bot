@@ -8,7 +8,8 @@ Deploy: Render (Background Worker)
 
 import os
 import logging
-from datetime import datetime, timedelta, time as dtime
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -18,10 +19,10 @@ from telegram.ext import (
 )
 
 from database import (
-    init_db, upsert_user, get_user,
-    add_category, get_categories, get_category_by_name, delete_category,
-    add_lesson, get_lesson, get_lessons, update_lesson, delete_lesson, search_lessons,
-    add_schedule, get_schedules, get_pending_notifications, mark_notified, delete_schedule,
+    init_db, upsert_user,
+    add_category, get_categories, delete_category,
+    add_lesson, get_lesson, get_lessons, delete_lesson, search_lessons,
+    add_schedule, get_schedules, get_pending_notifications, mark_notified,
 )
 from pdf_generator import generate_lesson_pdf
 from html_generator import generate_lesson_html
@@ -40,6 +41,7 @@ if env_path.exists():
 
 # ─── Configuration ───────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,29 +50,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Conversation States ─────────────────────────────────────────
-# Lesson creation
-(L_TITLE, L_CATEGORY, L_LEVEL, L_OBJECTIVE, L_CONTENT,
- L_ACTIVITIES, L_EVALUATION, L_MATERIALS, L_NOTES, L_DATE, L_TIME) = range(11)
+# Lesson creation with AI
+(AI_TOPIC, AI_LEVEL, AI_CATEGORY, AI_CONFIRM) = range(4)
 
 # Schedule creation
-(S_LESSON, S_DATE, S_TIME) = range(11, 14)
-
-# Lesson editing
-(E_SELECT, E_FIELD, E_VALUE) = range(14, 17)
+(S_DATE, S_TIME) = range(4, 6)
 
 # Category management
-(C_NAME,) = range(17, 18)
-
-# Search
-(SEARCH_TERM,) = range(18, 19)
+(C_NAME,) = range(6, 7)
 
 
 # ─── Keyboards ───────────────────────────────────────────────────
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
+            InlineKeyboardButton("🤖 Criar com IA", callback_data="menu_create_ai"),
             InlineKeyboardButton("📚 Minhas Aulas", callback_data="menu_lessons"),
-            InlineKeyboardButton("➕ Criar Aula", callback_data="menu_create"),
         ],
         [
             InlineKeyboardButton("📅 Agenda", callback_data="menu_schedule"),
@@ -83,11 +78,11 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def level_keyboard() -> InlineKeyboardMarkup:
+def level_keyboard(prefix: str = "lvl") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Iniciante", callback_data="level_iniciante")],
-        [InlineKeyboardButton("🟡 Intermediário", callback_data="level_intermediario")],
-        [InlineKeyboardButton("🔴 Avançado", callback_data="level_avancado")],
+        [InlineKeyboardButton("🟢 Iniciante", callback_data=f"{prefix}_iniciante")],
+        [InlineKeyboardButton("🟡 Intermediário", callback_data=f"{prefix}_intermediario")],
+        [InlineKeyboardButton("🔴 Avançado", callback_data=f"{prefix}_avancado")],
     ])
 
 
@@ -100,31 +95,98 @@ def category_inline_keyboard(user_id: int, include_new: bool = False) -> InlineK
         )])
     if include_new:
         buttons.append([InlineKeyboardButton("➕ Nova categoria", callback_data="cat_new")])
-    buttons.append([InlineKeyboardButton("⬅️ Voltar", callback_data="cat_back")])
+    buttons.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")])
     return InlineKeyboardMarkup(buttons)
 
 
+def back_menu_button() -> list:
+    """Single back-to-menu button row."""
+    return [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")]
+
+
+# ─── AI Lesson Generator ─────────────────────────────────────────
+
+def generate_lesson_with_ai(topic: str, level: str, category: str = "") -> dict | None:
+    """
+    Generate a lesson plan using available AI provider.
+    Tries OpenAI first, then Groq, then returns None.
+    """
+    system_prompt = """Você é um assistente especializado em criar planos de aula para professores.
+Gere um plano de aula completo e bem estruturado.
+
+Responda APENAS com um JSON válido no formato:
+{
+    "objetivo": "O que o aluno vai aprender (2-3 frases)",
+    "conteudo": "Conteúdo detalhado da aula (tópicos, conceitos)",
+    "atividades": "Atividades práticas e exercícios (lista)",
+    "avaliacao": "Como avaliar o aprendizado (2-3 frases)",
+    "materiais": "Materiais necessários (lista)",
+    "observacoes": "Dicas para o professor (opcional)"
+}
+
+Regras:
+- Linguagem clara e objetiva em português brasileiro
+- Adapte ao nível solicitado
+- Seja prático — professor precisa usar na vida real
+- Máximo 200 palavras por campo"""
+
+    user_message = f"Tópico: {topic}\nNível: {level}"
+    if category:
+        user_message += f"\nCategoria: {category}"
+
+    # Try OpenAI
+    if OPENAI_API_KEY:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=1500,
+                temperature=0.7,
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"OpenAI error: {e}")
+
+    # Try Groq (free)
+    try:
+        from groq import Groq
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        if groq_key:
+            client = Groq(api_key=groq_key)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=1500,
+                temperature=0.7,
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+    except ImportError:
+        logger.info("Groq not installed, skipping")
+    except Exception as e:
+        logger.error(f"Groq error: {e}")
+
+    return None
+
+
 # ─── Helper Functions ────────────────────────────────────────────
-def format_lesson_summary(lesson: dict) -> str:
-    """Format a single lesson as a short summary."""
-    parts = [f"📚 *{lesson['title']}*"]
-    if lesson.get('category_name'):
-        parts.append(f"   📁 {lesson['category_name']}")
-    parts.append(f"   📊 Nível: {lesson['level'].capitalize()}")
-    if lesson.get('date'):
-        date_str = lesson['date']
-        if lesson.get('time'):
-            date_str += f" às {lesson['time']}"
-        parts.append(f"   📅 {date_str}")
-    return "\n".join(parts)
-
-
 def format_lesson_detail(lesson: dict) -> str:
     """Format a single lesson with full details."""
     lines = [
         f"📚 *{lesson['title']}*",
         f"📁 Categoria: {lesson.get('category_name', 'Sem categoria')}",
-        f"📊 Nível: {lesson['level'].capitalize()}",
+        f"📊 Nível: {lesson.get('level', 'N/A').capitalize()}",
     ]
     if lesson.get('date'):
         dt = lesson['date']
@@ -155,12 +217,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     welcome = (
         f"👋 Olá, *{user.first_name or 'Professor'}*!\n\n"
-        "Bem-vindo ao *Class Bot* — seu assistente de aulas.\n\n"
-        "Aqui você pode:\n"
-        "📚 Criar e gerenciar planos de aula\n"
-        "📅 Agendar aulas com notificações\n"
-        "📄 Exportar em PDF ou HTML para impressão\n"
-        "🔍 Buscar e filtrar suas aulas\n\n"
+        "Bem-vindo ao *Class Bot* — seu assistente de aulas com IA.\n\n"
+        "🤖 *Criar com IA* — diga o tópico e a IA monta o plano\n"
+        "📚 *Minhas Aulas* — ver e gerenciar aulas salvas\n"
+        "📅 *Agenda* — aulas agendadas com notificações\n"
+        "📄 *Exportar* — PDF ou HTML para impressão\n\n"
         "O que deseja fazer?"
     )
     await update.message.reply_text(
@@ -183,8 +244,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
         "📖 *Comandos disponíveis:*\n\n"
         "/start — Menu principal\n"
+        "/criar — Criar aula com IA\n"
         "/aulas — Listar suas aulas\n"
-        "/criar — Criar nova aula\n"
         "/agenda — Ver agenda\n"
         "/buscar [termo] — Buscar aulas\n"
         "/categorias — Gerenciar categorias\n"
@@ -198,259 +259,250 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-# ─── Lesson Creation (ConversationHandler) ──────────────────────
+# ─── AI Lesson Creation (ConversationHandler) ───────────────────
 
-async def lesson_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start lesson creation flow."""
+async def ai_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start AI lesson creation flow."""
     query = update.callback_query
     if query:
         await query.answer()
         await query.edit_message_text(
-            "➕ *Criar Nova Aula*\n\n"
-            "Passo 1/11: Qual o *título* da aula?",
+            "🤖 *Criar Aula com IA*\n\n"
+            "Passo 1/3: Qual o *tópico* da aula?\n\n"
+            "Exemplo: Introdução a Python, Fotossíntese, Revolução Francesa",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            "➕ *Criar Nova Aula*\n\n"
-            "Passo 1/11: Qual o *título* da aula?",
+            "🤖 *Criar Aula com IA*\n\n"
+            "Passo 1/3: Qual o *tópico* da aula?\n\n"
+            "Exemplo: Introdução a Python, Fotossíntese, Revolução Francesa",
             parse_mode="Markdown"
         )
-    return L_TITLE
+    return AI_TOPIC
 
 
-async def lesson_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['lesson'] = {'title': update.message.text}
-    user_id = update.effective_user.id
-
-    cats = get_categories(user_id)
-    if not cats:
-        # No categories — ask to create one
-        await update.message.reply_text(
-            "📁 Você ainda não tem categorias.\n\n"
-            "Digite o nome da primeira categoria:",
-            parse_mode="Markdown"
-        )
-        context.user_data['lesson']['awaiting_category'] = True
-        return L_CATEGORY
+async def ai_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['ai_lesson'] = {'topic': update.message.text}
 
     await update.message.reply_text(
-        "Passo 2/11: Escolha a *categoria*:",
+        f"📌 Tópico: *{update.message.text}*\n\n"
+        "Passo 2/3: Qual o *nível* da aula?",
         parse_mode="Markdown",
-        reply_markup=category_inline_keyboard(user_id, include_new=True)
+        reply_markup=level_keyboard("ai_lvl")
     )
-    return L_CATEGORY
+    return AI_LEVEL
 
 
-async def lesson_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def ai_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    level = query.data.replace("ai_lvl_", "")
+    context.user_data['ai_lesson']['level'] = level
+
+    user_id = update.effective_user.id
+    cats = get_categories(user_id)
+
+    if not cats:
+        # No categories — skip to generation
+        context.user_data['ai_lesson']['category_name'] = ""
+        return await ai_generate_lesson(update, context)
+
+    buttons = []
+    for cat in cats:
+        buttons.append([InlineKeyboardButton(
+            f"📁 {cat['name']}", callback_data=f"ai_cat_{cat['id']}"
+        )])
+    buttons.append([InlineKeyboardButton("⏭️ Pular (sem categoria)", callback_data="ai_cat_skip")])
+    buttons.append(back_menu_button())
+
+    await query.edit_message_text(
+        f"📊 Nível: *{level.capitalize()}*\n\n"
+        "Passo 3/3: Escolha a *categoria*:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return AI_CATEGORY
+
+
+async def ai_category(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cat_new":
-        await query.edit_message_text("Digite o nome da nova categoria:")
-        context.user_data['lesson']['awaiting_category'] = True
-        return L_CATEGORY
-
-    if query.data == "cat_back":
+    if query.data == "ai_cat_skip":
+        context.user_data['ai_lesson']['category_id'] = None
+        context.user_data['ai_lesson']['category_name'] = ""
+    elif query.data == "menu_back":
         await query.edit_message_text(
             "❌ Operação cancelada.",
             reply_markup=main_menu_keyboard()
         )
         return ConversationHandler.END
+    else:
+        cat_id = int(query.data.replace("ai_cat_", ""))
+        context.user_data['ai_lesson']['category_id'] = cat_id
+        # Get category name
+        cats = get_categories(update.effective_user.id)
+        for cat in cats:
+            if cat['id'] == cat_id:
+                context.user_data['ai_lesson']['category_name'] = cat['name']
+                break
 
-    cat_id = int(query.data.replace("cat_", ""))
-    context.user_data['lesson']['category_id'] = cat_id
+    return await ai_generate_lesson(update, context)
 
-    await query.edit_message_text(
-        "Passo 3/11: Qual o *nível* da aula?",
-        parse_mode="Markdown",
-        reply_markup=level_keyboard()
+
+async def ai_generate_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Generate lesson with AI and show for review."""
+    query = update.callback_query
+    data = context.user_data['ai_lesson']
+
+    if query:
+        await query.edit_message_text(
+            f"⏳ *Gerando aula com IA...*\n\n"
+            f"📌 Tópico: {data['topic']}\n"
+            f"📊 Nível: {data['level'].capitalize()}\n"
+            f"📁 Categoria: {data.get('category_name', 'Sem categoria')}\n\n"
+            "Isso leva alguns segundos...",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"⏳ *Gerando aula com IA...*\n\n"
+            f"📌 Tópico: {data['topic']}\n"
+            f"📊 Nível: {data['level'].capitalize()}\n\n"
+            "Isso leva alguns segundos...",
+            parse_mode="Markdown"
+        )
+
+    # Generate
+    result = generate_lesson_with_ai(
+        topic=data['topic'],
+        level=data['level'],
+        category=data.get('category_name', '')
     )
-    return L_LEVEL
 
+    if not result:
+        text = (
+            "❌ *Erro ao gerar aula com IA*\n\n"
+            "Nenhuma API de IA está configurada.\n\n"
+            "Para usar esta funcionalidade, configure uma das APIs:\n"
+            "• OpenAI (OPENAI_API_KEY)\n"
+            "• Groq (GROQ_API_KEY) — gratuito\n\n"
+            "Enquanto isso, você pode criar aulas manualmente."
+        )
+        if query:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        context.user_data.pop('ai_lesson', None)
+        return ConversationHandler.END
 
-async def lesson_category_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle text input for new category."""
-    name = update.message.text.strip()
-    user_id = update.effective_user.id
-    cat_id = add_category(user_id, name)
-    context.user_data['lesson']['category_id'] = cat_id
+    # Store generated content
+    context.user_data['ai_result'] = result
 
-    await update.message.reply_text(
-        f"✅ Categoria *{name}* criada!\n\n"
-        "Passo 3/11: Qual o *nível* da aula?",
-        parse_mode="Markdown",
-        reply_markup=level_keyboard()
+    # Show generated lesson for review
+    review_text = (
+        f"🤖 *Aula Gerada pela IA*\n\n"
+        f"📌 *Tópico:* {data['topic']}\n"
+        f"📊 *Nível:* {data['level'].capitalize()}\n"
+        f"📁 *Categoria:* {data.get('category_name', 'Sem categoria')}\n\n"
+        f"🎯 *Objetivo:*\n{result.get('objetivo', 'N/A')}\n\n"
+        f"📖 *Conteúdo:*\n{result.get('conteudo', 'N/A')}\n\n"
+        f"✏️ *Atividades:*\n{result.get('atividades', 'N/A')}\n\n"
+        f"📝 *Avaliação:*\n{result.get('avaliacao', 'N/A')}\n\n"
+        f"🧰 *Materiais:*\n{result.get('materiais', 'N/A')}\n\n"
+        f"💡 *Observações:*\n{result.get('observacoes', 'N/A')}\n\n"
+        "O que deseja fazer?"
     )
-    return L_LEVEL
+
+    buttons = [
+        [
+            InlineKeyboardButton("✅ Salvar Aula", callback_data="ai_save"),
+            InlineKeyboardButton("🔄 Regerar", callback_data="ai_regen"),
+        ],
+        [
+            InlineKeyboardButton("❌ Descartar", callback_data="ai_discard"),
+        ],
+        back_menu_button(),
+    ]
+
+    if query:
+        await query.edit_message_text(
+            review_text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await update.message.reply_text(
+            review_text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    return AI_CONFIRM
 
 
-async def lesson_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def ai_save_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Save the AI-generated lesson."""
     query = update.callback_query
     await query.answer()
-    level = query.data.replace("level_", "")
-    context.user_data['lesson']['level'] = level
 
-    await query.edit_message_text(
-        "Passo 4/11: Qual o *objetivo* da aula?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_OBJECTIVE
+    data = context.user_data.get('ai_lesson', {})
+    result = context.user_data.get('ai_result', {})
+    user_id = update.effective_user.id
 
-
-async def lesson_objective(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['objective'] = update.message.text
-    else:
-        context.user_data['lesson']['objective'] = ""
-
-    await update.message.reply_text(
-        "Passo 5/11: Qual o *conteúdo* da aula?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_CONTENT
-
-
-async def lesson_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['content'] = update.message.text
-    else:
-        context.user_data['lesson']['content'] = ""
-
-    await update.message.reply_text(
-        "Passo 6/11: Quais *atividades* serão realizadas?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_ACTIVITIES
-
-
-async def lesson_activities(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['activities'] = update.message.text
-    else:
-        context.user_data['lesson']['activities'] = ""
-
-    await update.message.reply_text(
-        "Passo 7/11: Como será a *avaliação*?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_EVALUATION
-
-
-async def lesson_evaluation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['evaluation'] = update.message.text
-    else:
-        context.user_data['lesson']['evaluation'] = ""
-
-    await update.message.reply_text(
-        "Passo 8/11: Quais *materiais* são necessários?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_MATERIALS
-
-
-async def lesson_materials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['materials'] = update.message.text
-    else:
-        context.user_data['lesson']['materials'] = ""
-
-    await update.message.reply_text(
-        "Passo 9/11: Alguma *observação*?\n\n"
-        "(ou /pular para deixar em branco)",
-        parse_mode="Markdown"
-    )
-    return L_NOTES
-
-
-async def lesson_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        context.user_data['lesson']['notes'] = update.message.text
-    else:
-        context.user_data['lesson']['notes'] = ""
-
-    await update.message.reply_text(
-        "Passo 10/11: Qual a *data* da aula? (DD/MM/AAAA)\n\n"
-        "(ou /pular para deixar sem data)",
-        parse_mode="Markdown"
-    )
-    return L_DATE
-
-
-async def lesson_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        # Validate date format
-        try:
-            datetime.strptime(update.message.text, "%d/%m/%Y")
-            context.user_data['lesson']['date'] = update.message.text
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Formato inválido. Use DD/MM/AAAA\n\n"
-                "Tente novamente ou /pular:",
-                parse_mode="Markdown"
-            )
-            return L_DATE
-    else:
-        context.user_data['lesson']['date'] = ""
-
-    await update.message.reply_text(
-        "Passo 11/11: Qual o *horário* da aula? (HH:MM)\n\n"
-        "(ou /pular para deixar sem horário)",
-        parse_mode="Markdown"
-    )
-    return L_TIME
-
-
-async def lesson_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.message.text != "/pular":
-        try:
-            datetime.strptime(update.message.text, "%H:%M")
-            context.user_data['lesson']['time'] = update.message.text
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Formato inválido. Use HH:MM\n\n"
-                "Tente novamente ou /pular:",
-                parse_mode="Markdown"
-            )
-            return L_TIME
-    else:
-        context.user_data['lesson']['time'] = ""
+    # Get or create category
+    cat_id = data.get('category_id')
+    if not cat_id and data.get('category_name'):
+        cat_id = add_category(user_id, data['category_name'])
 
     # Save lesson
-    data = context.user_data['lesson']
-    user_id = update.effective_user.id
     lesson_id = add_lesson(
         user_id=user_id,
-        title=data['title'],
-        category_id=data.get('category_id'),
+        title=data['topic'],
+        category_id=cat_id,
         level=data.get('level', 'iniciante'),
-        objective=data.get('objective', ''),
-        content=data.get('content', ''),
-        activities=data.get('activities', ''),
-        evaluation=data.get('evaluation', ''),
-        materials=data.get('materials', ''),
-        notes=data.get('notes', ''),
-        date=data.get('date', ''),
-        time=data.get('time', ''),
+        objective=result.get('objetivo', ''),
+        content=result.get('conteudo', ''),
+        activities=result.get('atividades', ''),
+        evaluation=result.get('avaliacao', ''),
+        materials=result.get('materiais', ''),
+        notes=result.get('observacoes', ''),
+        date='',
+        time='',
     )
 
     lesson = get_lesson(lesson_id, user_id)
 
-    await update.message.reply_text(
-        f"✅ *Aula criada com sucesso!*\n\n"
+    await query.edit_message_text(
+        f"✅ *Aula salva com sucesso!*\n\n"
         f"{format_lesson_detail(lesson)}\n\n"
         "O que deseja fazer agora?",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
 
-    context.user_data.pop('lesson', None)
+    context.user_data.pop('ai_lesson', None)
+    context.user_data.pop('ai_result', None)
+    return ConversationHandler.END
+
+
+async def ai_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Regenerate the lesson."""
+    query = update.callback_query
+    await query.answer()
+    return await ai_generate_lesson(update, context)
+
+
+async def ai_discard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Discard the generated lesson."""
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "🗑️ Aula descartada.\n\nO que deseja fazer?",
+        reply_markup=main_menu_keyboard()
+    )
+    context.user_data.pop('ai_lesson', None)
+    context.user_data.pop('ai_result', None)
     return ConversationHandler.END
 
 
@@ -462,21 +514,27 @@ async def cmd_lessons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lessons = get_lessons(user_id, limit=20)
 
     if not lessons:
-        text = "📚 Você ainda não tem aulas criadas.\n\nUse /criar para criar sua primeira aula!"
+        text = "📚 Você ainda não tem aulas criadas.\n\nUse 🤖 Criar com IA para gerar sua primeira aula!"
         if update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text(text, reply_markup=main_menu_keyboard())
+            await update.callback_query.edit_message_text(
+                text, parse_mode="Markdown",
+                reply_markup=main_menu_keyboard()
+            )
         else:
-            await update.message.reply_text(text, reply_markup=main_menu_keyboard())
+            await update.message.reply_text(
+                text, parse_mode="Markdown",
+                reply_markup=main_menu_keyboard()
+            )
         return
 
     buttons = []
     for lesson in lessons:
-        date_str = lesson.get('date', 'Sem data')
+        date_str = lesson.get('date', '') or 'Sem data'
         btn_text = f"📚 {lesson['title']} ({date_str})"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"lesson_{lesson['id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")])
+    buttons.append(back_menu_button())
     text = f"📚 *Suas Aulas* ({len(lessons)}):\n\nToque em uma aula para ver detalhes:"
 
     if update.callback_query:
@@ -502,7 +560,10 @@ async def lesson_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lesson = get_lesson(lesson_id, user_id)
 
     if not lesson:
-        await query.edit_message_text("❌ Aula não encontrada.", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(
+            "❌ Aula não encontrada.",
+            reply_markup=main_menu_keyboard()
+        )
         return
 
     text = format_lesson_detail(lesson)
@@ -514,12 +575,9 @@ async def lesson_detail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         ],
         [
             InlineKeyboardButton("📅 Agendar", callback_data=f"schedule_{lesson_id}"),
-            InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{lesson_id}"),
-        ],
-        [
             InlineKeyboardButton("🗑️ Excluir", callback_data=f"delete_{lesson_id}"),
         ],
-        [InlineKeyboardButton("⬅️ Voltar às Aulas", callback_data="menu_lessons")],
+        back_menu_button(),
     ]
 
     await query.edit_message_text(
@@ -555,7 +613,6 @@ async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 caption=f"📄 PDF da aula: *{lesson['title']}*",
                 parse_mode="Markdown",
             )
-        # Cleanup
         os.remove(filepath)
     except Exception as e:
         logger.error(f"PDF generation error: {e}")
@@ -595,7 +652,7 @@ async def export_html(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 filename=f"aula_{lesson['title']}.html",
                 caption=(
                     f"🌐 HTML da aula: *{lesson['title']}*\n\n"
-                    "Abra o arquivo no navegador e clique em 🖨️ Imprimir.\n"
+                    "Abra no navegador e clique em 🖨️ Imprimir.\n"
                     "Funciona no celular e no computador!"
                 ),
                 parse_mode="Markdown",
@@ -630,16 +687,15 @@ async def delete_lesson_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Aula não encontrada.", reply_markup=main_menu_keyboard())
         return
 
-    context.user_data['delete_lesson_id'] = lesson_id
-
     buttons = [
         [
             InlineKeyboardButton("✅ Sim, excluir", callback_data=f"confirm_delete_{lesson_id}"),
             InlineKeyboardButton("❌ Não, cancelar", callback_data=f"lesson_{lesson_id}"),
-        ]
+        ],
+        back_menu_button(),
     ]
     await query.edit_message_text(
-        f"⚠️ Tem certeza que deseja excluir a aula:\n\n"
+        f"⚠️ Tem certeza que deseja excluir:\n\n"
         f"📚 *{lesson['title']}*\n\n"
         f"Esta ação não pode ser desfeita!",
         parse_mode="Markdown",
@@ -681,7 +737,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text = (
             "📅 *Agenda*\n\n"
             "Nenhuma aula agendada para os próximos 7 dias.\n\n"
-            "Para agendar, vá em 'Minhas Aulas' → selecione uma aula → 'Agendar'."
+            "Para agendar, vá em 'Minhas Aulas' → selecione uma aula → '📅 Agendar'."
         )
         if update.callback_query:
             await update.callback_query.answer()
@@ -698,19 +754,23 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     lines = ["📅 *Agenda — Próximos 7 dias*\n"]
     for s in schedules:
-        status_1h = "✅" if s['notified_1h'] else "⏳"
-        status_15 = "✅" if s['notified_15min'] else "⏳"
+        # Format date from YYYY-MM-DD to DD/MM/YYYY
+        try:
+            dt = datetime.strptime(s['scheduled_date'], "%Y-%m-%d")
+            date_str = dt.strftime("%d/%m/%Y")
+        except (ValueError, TypeError):
+            date_str = s['scheduled_date']
+
         lines.append(
             f"📚 *{s['title']}*\n"
-            f"   📅 {s['scheduled_date']} às {s['scheduled_time']}\n"
+            f"   📅 {date_str} às {s['scheduled_time']}\n"
             f"   📊 {s['level'].capitalize()} | 📁 {s.get('category_name', 'Sem categoria')}\n"
-            f"   Notificações: 1h {status_1h} | 15min {status_15}\n"
         )
 
     buttons = [
         [InlineKeyboardButton("📅 Ver Hoje", callback_data="schedule_today")],
         [InlineKeyboardButton("📅 Ver Semana", callback_data="schedule_week")],
-        [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")],
+        back_menu_button(),
     ]
 
     if update.callback_query:
@@ -792,7 +852,7 @@ async def schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         f"✅ *Aula agendada!*\n\n"
         f"📚 {lesson['title']}\n"
         f"📅 {date} às {time_val}\n\n"
-        "Você receberá notificações 1 hora e 15 minutos antes da aula.\n\n"
+        "Você receberá notificações 1 hora e 15 minutos antes.\n\n"
         "O que deseja fazer agora?",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
@@ -813,9 +873,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text = "🔍 *Buscar Aulas*\n\nDigite o termo de busca:\n\nExemplo: `/buscar python`"
         if update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.edit_message_text(
-                text, parse_mode="Markdown"
-            )
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown")
         else:
             await update.message.reply_text(text, parse_mode="Markdown")
         return
@@ -846,7 +904,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             btn_text += f" ({lesson['date']})"
         buttons.append([InlineKeyboardButton(btn_text, callback_data=f"lesson_{lesson['id']}")])
 
-    buttons.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")])
+    buttons.append(back_menu_button())
     text = f"🔍 *Resultados para '{term}'* ({len(results)}):"
 
     if update.callback_query:
@@ -889,7 +947,7 @@ async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"📁 {cat['name']}  ✕", callback_data=f"delcat_{cat['id']}"
         )])
     buttons.append([InlineKeyboardButton("➕ Nova Categoria", callback_data="cat_add")])
-    buttons.append([InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="menu_back")])
+    buttons.append(back_menu_button())
 
     text = "📁 *Suas Categorias:*\n\nToque em uma categoria para excluí-la:"
 
@@ -994,48 +1052,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-# ─── Menu Callback Router ────────────────────────────────────────
-
-async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route main menu button presses."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-
-    if data == "menu_back" or data == "menu_lessons":
-        await cmd_lessons(update, context)
-    elif data == "menu_create":
-        await lesson_create_start(update, context)
-    elif data == "menu_schedule":
-        await cmd_schedule(update, context)
-    elif data == "menu_search":
-        await cmd_search(update, context)
-    elif data == "menu_categories":
-        await cmd_categories(update, context)
-    elif data == "menu_stats":
-        await cmd_stats(update, context)
-    elif data == "schedule_today":
-        await schedule_today(update, context)
-    elif data == "schedule_week":
-        await schedule_week(update, context)
-    elif data == "cat_add":
-        await category_add_start(update, context)
-    elif data.startswith("delcat_"):
-        await category_delete(update, context)
-    elif data.startswith("lesson_"):
-        await lesson_detail(update, context)
-    elif data.startswith("export_pdf_"):
-        await export_pdf(update, context)
-    elif data.startswith("export_html_"):
-        await export_html(update, context)
-    elif data.startswith("delete_"):
-        await delete_lesson_confirm(update, context)
-    elif data.startswith("confirm_delete_"):
-        await delete_lesson_execute(update, context)
-    elif data.startswith("schedule_"):
-        await schedule_lesson_start(update, context)
-
+# ─── Schedule Today/Week ─────────────────────────────────────────
 
 async def schedule_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show today's schedule."""
@@ -1047,7 +1064,7 @@ async def schedule_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if not schedules:
         await query.edit_message_text(
-            "📅 Nenhula aula agendada para hoje.",
+            "📅 Nenhuma aula agendada para hoje.",
             reply_markup=main_menu_keyboard()
         )
         return
@@ -1083,9 +1100,14 @@ async def schedule_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     lines = ["📅 *Aulas da Semana*\n"]
     for s in schedules:
+        try:
+            dt = datetime.strptime(s['scheduled_date'], "%Y-%m-%d")
+            date_str = dt.strftime("%d/%m/%Y")
+        except (ValueError, TypeError):
+            date_str = s['scheduled_date']
         lines.append(
             f"📚 *{s['title']}*\n"
-            f"   📅 {s['scheduled_date']} às {s['scheduled_time']}\n"
+            f"   📅 {date_str} às {s['scheduled_time']}\n"
         )
 
     await query.edit_message_text(
@@ -1100,7 +1122,6 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic job to check and send notifications."""
     now = datetime.now()
     today = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M")
 
     pending = get_pending_notifications()
 
@@ -1124,7 +1145,7 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=(
                         f"⏰ *Lembrete de Aula!*\n\n"
                         f"📚 *{sched['title']}*\n"
-                        f"📅 Hoje às {sched['time']}\n"
+                        f"📅 Hoje às {sched['scheduled_time']}\n"
                         f"📊 {sched['level'].capitalize()}\n\n"
                         f"Falta 1 hora para sua aula!"
                     ),
@@ -1142,7 +1163,7 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                     text=(
                         f"🔴 *Aula em 15 minutos!*\n\n"
                         f"📚 *{sched['title']}*\n"
-                        f"📅 Hoje às {sched['time']}\n"
+                        f"📅 Hoje às {sched['scheduled_time']}\n"
                         f"📊 {sched['level'].capitalize()}\n\n"
                         f"Prepare-se!"
                     ),
@@ -1160,66 +1181,89 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
 
 
+# ─── Menu Callback Router ────────────────────────────────────────
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route main menu button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+
+    if data == "menu_back":
+        await query.edit_message_text(
+            "🏠 *Menu Principal*\n\nO que deseja fazer?",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard()
+        )
+    elif data == "menu_lessons":
+        await cmd_lessons(update, context)
+    elif data == "menu_create_ai":
+        await ai_create_start(update, context)
+    elif data == "menu_schedule":
+        await cmd_schedule(update, context)
+    elif data == "menu_search":
+        await cmd_search(update, context)
+    elif data == "menu_categories":
+        await cmd_categories(update, context)
+    elif data == "menu_stats":
+        await cmd_stats(update, context)
+    elif data == "schedule_today":
+        await schedule_today(update, context)
+    elif data == "schedule_week":
+        await schedule_week(update, context)
+    elif data == "cat_add":
+        await category_add_start(update, context)
+    elif data.startswith("delcat_"):
+        await category_delete(update, context)
+    elif data.startswith("lesson_"):
+        await lesson_detail(update, context)
+    elif data.startswith("export_pdf_"):
+        await export_pdf(update, context)
+    elif data.startswith("export_html_"):
+        await export_html(update, context)
+    elif data.startswith("delete_"):
+        await delete_lesson_confirm(update, context)
+    elif data.startswith("confirm_delete_"):
+        await delete_lesson_execute(update, context)
+    elif data.startswith("schedule_"):
+        await schedule_lesson_start(update, context)
+    elif data == "ai_save":
+        await ai_save_lesson(update, context)
+    elif data == "ai_regen":
+        await ai_regenerate(update, context)
+    elif data == "ai_discard":
+        await ai_discard(update, context)
+
+
 # ─── Main ────────────────────────────────────────────────────────
 
 def main() -> None:
     """Start the bot."""
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set! Set the BOT_TOKEN environment variable.")
+        logger.error("BOT_TOKEN not set!")
         return
 
-    # Initialize database
     init_db()
 
-    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
 
     # ── Conversation Handlers ──
 
-    # Lesson creation
-    lesson_conv = ConversationHandler(
+    # AI Lesson creation
+    ai_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(lesson_create_start, pattern="^menu_create$"),
-            CommandHandler("criar", lesson_create_start),
+            CallbackQueryHandler(ai_create_start, pattern="^menu_create_ai$"),
+            CommandHandler("criar", ai_create_start),
         ],
         states={
-            L_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_title)],
-            L_CATEGORY: [
-                CallbackQueryHandler(lesson_category, pattern="^cat_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_category_text),
-            ],
-            L_LEVEL: [CallbackQueryHandler(lesson_level, pattern="^level_")],
-            L_OBJECTIVE: [
-                CommandHandler("pular", lesson_objective),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_objective),
-            ],
-            L_CONTENT: [
-                CommandHandler("pular", lesson_content),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_content),
-            ],
-            L_ACTIVITIES: [
-                CommandHandler("pular", lesson_activities),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_activities),
-            ],
-            L_EVALUATION: [
-                CommandHandler("pular", lesson_evaluation),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_evaluation),
-            ],
-            L_MATERIALS: [
-                CommandHandler("pular", lesson_materials),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_materials),
-            ],
-            L_NOTES: [
-                CommandHandler("pular", lesson_notes),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_notes),
-            ],
-            L_DATE: [
-                CommandHandler("pular", lesson_date),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_date),
-            ],
-            L_TIME: [
-                CommandHandler("pular", lesson_time),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, lesson_time),
+            AI_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, ai_topic)],
+            AI_LEVEL: [CallbackQueryHandler(ai_level, pattern="^ai_lvl_")],
+            AI_CATEGORY: [CallbackQueryHandler(ai_category, pattern="^ai_cat_")],
+            AI_CONFIRM: [
+                CallbackQueryHandler(ai_save_lesson, pattern="^ai_save$"),
+                CallbackQueryHandler(ai_regenerate, pattern="^ai_regen$"),
+                CallbackQueryHandler(ai_discard, pattern="^ai_discard$"),
             ],
         },
         fallbacks=[CommandHandler("cancelar", cmd_cancel)],
@@ -1260,19 +1304,15 @@ def main() -> None:
     app.add_handler(CommandHandler("categorias", cmd_categories))
     app.add_handler(CommandHandler("estatisticas", cmd_stats))
 
-    # Conversation handlers
-    app.add_handler(lesson_conv)
+    app.add_handler(ai_conv)
     app.add_handler(schedule_conv)
     app.add_handler(category_conv)
 
-    # Menu callback router (must be last)
     app.add_handler(CallbackQueryHandler(menu_router))
 
-    # Error handler
     app.add_error_handler(error_handler)
 
     # ── Notification Job ──
-    # Check every 5 minutes
     app.job_queue.run_repeating(check_notifications, interval=300, first=10)
 
     # ── Health Check Server (for Render) ──
@@ -1299,7 +1339,6 @@ def main() -> None:
         http_thread.start()
         logger.info(f"Health check server started on port {port}")
 
-    # ── Start Polling ──
     logger.info("Class Bot starting...")
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
