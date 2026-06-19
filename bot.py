@@ -26,6 +26,18 @@ from database import (
 from pdf_generator import generate_lesson_pdf
 from html_generator import generate_lesson_html
 
+# ─── Load .env file ──────────────────────────────────────────────
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+
 # ─── Configuration ───────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 

@@ -7,3 +7,4 @@ config.py
 /tmp/
 .DS_Store
 Thumbs.db
+.env
