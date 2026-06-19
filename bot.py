@@ -106,10 +106,12 @@ def back_menu_button() -> list:
 
 # ─── AI Lesson Generator ─────────────────────────────────────────
 
+# ─── AI Lesson Generator ─────────────────────────────────────────
+
 def generate_lesson_with_ai(topic: str, level: str, category: str = "") -> dict | None:
     """
     Generate a lesson plan using available AI provider.
-    Tries OpenAI first, then Groq, then returns None.
+    Priority: OpenRouter (Owl Alpha) → OpenAI → Groq
     """
     system_prompt = """Você é um assistente especializado em criar planos de aula para professores.
 Gere um plano de aula completo e bem estruturado.
@@ -126,7 +128,7 @@ Responda APENAS com um JSON válido no formato:
 
 Regras:
 - Linguagem clara e objetiva em português brasileiro
-- Adapte ao nível solicitado
+- Adapte ao nível solicitado (iniciante/intermediário/avançado)
 - Seja prático — professor precisa usar na vida real
 - Máximo 200 palavras por campo"""
 
@@ -134,7 +136,41 @@ Regras:
     if category:
         user_message += f"\nCategoria: {category}"
 
-    # Try OpenAI
+    # ── 1. Try OpenRouter (Owl Alpha) ──
+    or_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if or_key:
+        try:
+            from openai import OpenAI
+            client = OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=or_key,
+            )
+            response = client.chat.completions.create(
+                model="openrouter/owl-alpha",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                max_tokens=2000,
+                temperature=0.7,
+            )
+            content = response.choices[0].message.content
+            # Try to extract JSON from response
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # Try to find JSON in the text
+                import re
+                match = re.search(r'\{.*\}', content, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
+                logger.error(f"OpenRouter: could not parse JSON from response: {content[:200]}")
+        except ImportError:
+            logger.info("openai package not installed, skipping OpenRouter")
+        except Exception as e:
+            logger.error(f"OpenRouter error: {e}")
+
+    # ── 2. Try OpenAI ──
     if OPENAI_API_KEY:
         try:
             from openai import OpenAI
@@ -154,7 +190,7 @@ Regras:
         except Exception as e:
             logger.error(f"OpenAI error: {e}")
 
-    # Try Groq (free)
+    # ── 3. Try Groq (free) ──
     try:
         from groq import Groq
         groq_key = os.environ.get("GROQ_API_KEY", "")
@@ -386,9 +422,10 @@ async def ai_generate_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "❌ *Erro ao gerar aula com IA*\n\n"
             "Nenhuma API de IA está configurada.\n\n"
             "Para usar esta funcionalidade, configure uma das APIs:\n"
+            "• OpenRouter (OPENROUTER_API_KEY) — recomendado, usa Owl Alpha\n"
             "• OpenAI (OPENAI_API_KEY)\n"
             "• Groq (GROQ_API_KEY) — gratuito\n\n"
-            "Enquanto isso, você pode criar aulas manualmente."
+            "Acesse [openrouter.ai](https://openrouter.ai) para criar uma API key gratuita."
         )
         if query:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
