@@ -20,7 +20,7 @@ from telegram.ext import (
 
 from database import (
     init_db, upsert_user,
-    add_category, get_categories, delete_category,
+    add_category, get_categories, get_category_by_name, delete_category,
     add_lesson, get_lesson, get_lessons, delete_lesson, search_lessons,
     add_schedule, get_schedules, get_pending_notifications, mark_notified,
 )
@@ -110,27 +110,41 @@ def back_menu_button() -> list:
 
 def generate_lesson_with_ai(topic: str, level: str, category: str = "") -> dict | None:
     """
-    Generate a lesson plan using available AI provider.
+    Generate a complete lesson plan ready for printing (student handout + teacher guide).
     Priority: OpenRouter (Owl Alpha) → OpenAI → Groq
+    Returns dict with: categoria, objetivo, conteudo, atividades, avaliacao, materiais, observacoes
     """
-    system_prompt = """Você é um assistente especializado em criar planos de aula para professores.
-Gere um plano de aula completo e bem estruturado.
+    system_prompt = """Você é um professor especializado em criar aulas prontas para impressão.
+Sua tarefa é gerar uma AULA COMPLETA (tipo apostila/mini-curso) que o professor pode imprimir e usar diretamente com o aluno.
+
+A aula deve ter:
+1. CONTEXTUALIZAÇÃO: texto introdutório explicando o tema de forma simples e prática, com exemplos do cotidiano
+2. CONTEÚDO: explicação detalhada com exemplos, tabelas comparativas, dicas
+3. ATIVIDADES: exercícios práticos com espaços para o aluno responder (com gabarito separado)
+4. QUESTIONÁRIO: 5-10 perguntas de múltipla escolha ou lacunas para fixação
+5. GABARITO: respostas de todas as atividades
 
 Responda APENAS com um JSON válido no formato:
 {
-    "objetivo": "O que o aluno vai aprender (2-3 frases)",
-    "conteudo": "Conteúdo detalhado da aula (tópicos, conceitos)",
-    "atividades": "Atividades práticas e exercícios (lista)",
-    "avaliacao": "Como avaliar o aprendizado (2-3 frases)",
-    "materiais": "Materiais necessários (lista)",
-    "observacoes": "Dicas para o professor (opcional)"
+    "categoria": "nome da matéria/área (ex: Inglês, Matemática, História, Programação)",
+    "objetivo": "O que o aluno vai aprender (2-3 frases claras)",
+    "contextualizacao": "Texto introdutório de 1-2 parágrafos explicando o tema de forma simples, com exemplos práticos do cotidiano. Linguagem acessível ao nível do aluno.",
+    "conteudo": "Explicação detalhada do conteúdo com exemplos, regras, tabelas comparativas. Use formatação clara com tópicos numerados.",
+    "atividades": "3-5 exercícios práticos com espaços para resposta. Inclua instruções claras para cada exercício.",
+    "questionario": "5-10 perguntas de múltipla escolha ou preenchimento de lacunas sobre o conteúdo da aula. Cada pergunta com 4 alternativas (A, B, C, D).",
+    "gabarito": "Respostas corretas de TODAS as atividades e do questionário, na mesma ordem.",
+    "avaliacao": "Como o professor pode avaliar o aprendizado (2-3 frases)",
+    "materiais": "Materiais necessários para a aula (lista simples)",
+    "observacoes": "Dicas para o professor sobre pontos de atenção, erros comuns dos alunos, sugestões de abordagem"
 }
 
-Regras:
+Regras importantes:
 - Linguagem clara e objetiva em português brasileiro
-- Adapte ao nível solicitado (iniciante/intermediário/avançado)
-- Seja prático — professor precisa usar na vida real
-- Máximo 200 palavras por campo"""
+- Adapte ao nível: iniciante (linguagem muito simples, muitos exemplos), intermediário (linguagem moderada), avançado (linguagem técnica)
+- A contextualização deve conectar o tema com a vida real do aluno
+- As atividades devem ter dificuldade progressiva (fácil → médio → difícil)
+- O questionário deve cobrir todo o conteúdo apresentado
+- Máximo 300 palavras por campo (exceto conteúdo e atividades que podem ser mais longos)"""
 
     user_message = f"Tópico: {topic}\nNível: {level}"
     if category:
@@ -151,20 +165,18 @@ Regras:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
                 ],
-                max_tokens=2000,
+                max_tokens=3000,
                 temperature=0.7,
             )
             content = response.choices[0].message.content
-            # Try to extract JSON from response
             try:
                 return json.loads(content)
             except json.JSONDecodeError:
-                # Try to find JSON in the text
                 import re
                 match = re.search(r'\{.*\}', content, re.DOTALL)
                 if match:
                     return json.loads(match.group())
-                logger.error(f"OpenRouter: could not parse JSON from response: {content[:200]}")
+                logger.error(f"OpenRouter: could not parse JSON: {content[:200]}")
         except ImportError:
             logger.info("openai package not installed, skipping OpenRouter")
         except Exception as e:
@@ -182,7 +194,7 @@ Regras:
                     {"role": "user", "content": user_message},
                 ],
                 response_format={"type": "json_object"},
-                max_tokens=1500,
+                max_tokens=2500,
                 temperature=0.7,
             )
             content = response.choices[0].message.content
@@ -203,7 +215,7 @@ Regras:
                     {"role": "user", "content": user_message},
                 ],
                 response_format={"type": "json_object"},
-                max_tokens=1500,
+                max_tokens=2500,
                 temperature=0.7,
             )
             content = response.choices[0].message.content
@@ -420,12 +432,12 @@ async def ai_generate_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not result:
         text = (
             "❌ *Erro ao gerar aula com IA*\n\n"
-            "Nenhuma API de IA está configurada.\n\n"
-            "Para usar esta funcionalidade, configure uma das APIs:\n"
-            "• OpenRouter (OPENROUTER_API_KEY) — recomendado, usa Owl Alpha\n"
-            "• OpenAI (OPENAI_API_KEY)\n"
-            "• Groq (GROQ_API_KEY) — gratuito\n\n"
-            "Acesse [openrouter.ai](https://openrouter.ai) para criar uma API key gratuita."
+            "O serviço de IA não está configurado ainda.\n\n"
+            "Para usar a geração automática de aulas, você precisa:\n"
+            "1. Criar uma conta gratuita em openrouter.ai\n"
+            "2. Gerar uma chave de acesso\n"
+            "3. Adicionar a chave no arquivo de configuração\n\n"
+            "Peça ao administrador do sistema para configurar."
         )
         if query:
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
@@ -486,10 +498,38 @@ async def ai_save_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     result = context.user_data.get('ai_result', {})
     user_id = update.effective_user.id
 
-    # Get or create category
+    # Get or create category — use AI-generated category if available
     cat_id = data.get('category_id')
-    if not cat_id and data.get('category_name'):
-        cat_id = add_category(user_id, data['category_name'])
+    cat_name = data.get('category_name', '')
+
+    # If AI generated a category name, use it
+    ai_category = result.get('categoria', '').strip()
+    if ai_category and not cat_id:
+        cat_name = ai_category
+        existing = get_category_by_name(user_id, cat_name)
+        if existing:
+            cat_id = existing['id']
+        else:
+            cat_id = add_category(user_id, cat_name)
+    elif cat_name and not cat_id:
+        existing = get_category_by_name(user_id, cat_name)
+        if existing:
+            cat_id = existing['id']
+        else:
+            cat_id = add_category(user_id, cat_name)
+
+    # Build content with all AI-generated sections
+    full_content = ""
+    if result.get('contextualizacao'):
+        full_content += f"📖 CONTEXTUALIZAÇÃO\n\n{result['contextualizacao']}\n\n"
+    if result.get('conteudo'):
+        full_content += f"📚 CONTEÚDO\n\n{result['conteudo']}\n\n"
+    if result.get('atividades'):
+        full_content += f"✏️ ATIVIDADES\n\n{result['atividades']}\n\n"
+    if result.get('questionario'):
+        full_content += f"📝 QUESTIONÁRIO\n\n{result['questionario']}\n\n"
+    if result.get('gabarito'):
+        full_content += f"✅ GABARITO\n\n{result['gabarito']}\n\n"
 
     # Save lesson
     lesson_id = add_lesson(
@@ -498,7 +538,7 @@ async def ai_save_lesson(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         category_id=cat_id,
         level=data.get('level', 'iniciante'),
         objective=result.get('objetivo', ''),
-        content=result.get('conteudo', ''),
+        content=full_content.strip(),
         activities=result.get('atividades', ''),
         evaluation=result.get('avaliacao', ''),
         materials=result.get('materiais', ''),
