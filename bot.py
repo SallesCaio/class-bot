@@ -112,7 +112,6 @@ def generate_lesson_with_ai(topic: str, level: str, category: str = "") -> dict 
     """
     Generate a complete lesson plan ready for printing (student handout + teacher guide).
     Priority: OpenRouter (Owl Alpha) → OpenAI → Groq
-    Returns dict with: categoria, objetivo, conteudo, atividades, avaliacao, materiais, observacoes
     """
     system_prompt = """Você é um professor especializado em criar aulas prontas para impressão.
 Sua tarefa é gerar uma AULA COMPLETA (tipo apostila/mini-curso) que o professor pode imprimir e usar diretamente com o aluno.
@@ -150,35 +149,43 @@ Regras importantes:
     if category:
         user_message += f"\nCategoria: {category}"
 
-    # ── 1. Try OpenRouter (Owl Alpha) ──
+    # ── 1. Try OpenRouter (Owl Alpha) with timeout ──
     or_key = os.environ.get("OPENROUTER_API_KEY", "")
     if or_key:
         try:
-            from openai import OpenAI
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=or_key,
+            import requests as req_lib
+            response = req_lib.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {or_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "openrouter/owl-alpha",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "max_tokens": 3000,
+                    "temperature": 0.7,
+                },
+                timeout=120,  # 2 minutes max
             )
-            response = client.chat.completions.create(
-                model="openrouter/owl-alpha",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                max_tokens=3000,
-                temperature=0.7,
-            )
-            content = response.choices[0].message.content
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                import re
-                match = re.search(r'\{.*\}', content, re.DOTALL)
-                if match:
-                    return json.loads(match.group())
-                logger.error(f"OpenRouter: could not parse JSON: {content[:200]}")
-        except ImportError:
-            logger.info("openai package not installed, skipping OpenRouter")
+            if response.status_code == 200:
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    import re
+                    match = re.search(r'\{.*\}', content, re.DOTALL)
+                    if match:
+                        return json.loads(match.group())
+                    logger.error(f"OpenRouter: could not parse JSON: {content[:200]}")
+            else:
+                logger.error(f"OpenRouter HTTP {response.status_code}: {response.text[:200]}")
+        except req_lib.exceptions.Timeout:
+            logger.error("OpenRouter timeout after 120s")
         except Exception as e:
             logger.error(f"OpenRouter error: {e}")
 
@@ -196,6 +203,7 @@ Regras importantes:
                 response_format={"type": "json_object"},
                 max_tokens=2500,
                 temperature=0.7,
+                timeout=120,
             )
             content = response.choices[0].message.content
             return json.loads(content)
@@ -217,6 +225,7 @@ Regras importantes:
                 response_format={"type": "json_object"},
                 max_tokens=2500,
                 temperature=0.7,
+                timeout=120,
             )
             content = response.choices[0].message.content
             return json.loads(content)
